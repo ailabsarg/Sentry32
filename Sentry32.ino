@@ -73,7 +73,7 @@ unsigned long lastScanMillis = 0;
 // - Backoff grows by 1.5x each failed attempt: 5s, 7.5s, 11.25s, ...
 // - Capped to a large max to avoid uint32 overflow / absurd waits.
 static const uint8_t  RL_SLOTS  = 32;
-static const uint32_t RL_TTL_MS = 10UL * 60UL * 1000UL;   // recycle entry after 10 min idle
+static const uint32_t RL_TTL_MS = 49UL * 60UL * 60UL * 1000UL; // 49 hours
 
 static const uint32_t RL_BASE_MS = 5000UL;                // 5 seconds
 static const uint32_t RL_MAX_MS  = 48UL * 60UL * 60UL * 1000UL; // 48 hours
