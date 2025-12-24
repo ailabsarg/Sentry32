@@ -208,26 +208,49 @@ If you need a reliable ESP32-based LAN sentinel with:
 
 ## 🔐 Transport Security (HTTP vs HTTPS)
 
-Sentry32 exposes its web interface and control endpoints over **plain HTTP**.
+Sentry32 exposes its web interface over **plain HTTP**.
 
-### What this means
-
-- Authentication is enforced via **HTTP Basic Auth**
+- All endpoints are protected by **HTTP Basic Authentication**
 - Credentials are **not encrypted at the transport layer**
-- Traffic can theoretically be **sniffed on the local network**
+- Traffic can be sniffed by:
+  - Other users on the **same local network**
+  - Network operators (e.g. ISP) *if* the device is exposed to the Internet
 
-This is a deliberate design choice based on the project goals:
+This is a **deliberate design choice**.
 
-- Sentry32 is intended to run **inside trusted LAN environments**
-- It prioritizes **robustness, simplicity, and long-term stability**
-- Avoids TLS complexity, certificate management, and memory overhead on ESP32
+### Design assumptions
 
-### Threat model
+Sentry32 is designed to run:
 
-Sentry32 assumes:
-- A trusted local network
-- No hostile actors with packet-sniffing access
-- Use behind NAT / firewall (not exposed directly to the internet)
+- Inside a **trusted LAN**
+- Behind **NAT, firewall, or VPN**
+- Prioritizing:
+  - Simplicity
+  - Deterministic behavior
+  - Long-term stability on ESP32 hardware
 
-If your threat model includes untrusted LAN users or shared WiFi,
-**additional protections are recommended**.
+TLS is intentionally avoided to reduce complexity and memory usage.
+
+### ⚠️ Internet exposure warning
+
+Sentry32 is **not designed to be exposed directly to the public Internet**.
+
+If exposed and credentials are compromised, an attacker could:
+- Trigger Wake-on-LAN packets
+- Force device reconfiguration
+- Cause denial-of-service on this device
+
+Impact is **operational only**.  
+No remote code execution or LAN pivoting is possible.
+
+### Recommendations
+
+- Do not expose port 80 publicly
+- Deploy on a trusted network
+- For remote access, use:
+  - VPN
+  - SSH tunnel
+  - Reverse proxy with TLS
+- Use **strong, unique credentials**
+
+
