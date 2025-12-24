@@ -240,9 +240,6 @@ If exposed and credentials are compromised, an attacker could:
 - Force device reconfiguration
 - Cause denial-of-service on this device
 
-Impact is **operational only**.  
-No remote code execution or LAN pivoting is possible.
-
 ### Recommendations
 
 - Do not expose port 80 publicly
