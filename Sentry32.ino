@@ -27,8 +27,6 @@ const int STATUS_LED_PIN = 2;   // Built-in LED on many ESP32 boards (often GPIO
 // =======================
 // === DEFAULT SETTINGS ===
 // =======================
-// Defaults only. Real values are loaded from NVS (Preferences) and can be set
-// in the WiFiManager portal on first setup.
 String httpUser = "changemeuser";
 String httpPass = "changemepass";
 String workerId = ""; // If empty, we use WiFi hostname (e.g., "esp32-XXXXXX")
@@ -68,6 +66,104 @@ TaskHandle_t scanTaskHandle = nullptr;
 unsigned long lastScanMillis = 0;
 
 // =======================
+// === SIMPLE RATE LIMIT ===
+// =======================
+// - Applies to ALL endpoints via checkAuth()
+// - No delay() used (never blocks loop). We reject until nextOk.
+// - Backoff grows by 1.5x each failed attempt: 5s, 7.5s, 11.25s, ...
+// - Capped to a large max to avoid uint32 overflow / absurd waits.
+static const uint8_t  RL_SLOTS  = 32;
+static const uint32_t RL_TTL_MS = 10UL * 60UL * 1000UL;   // recycle entry after 10 min idle
+
+static const uint32_t RL_BASE_MS = 5000UL;                // 5 seconds
+static const uint32_t RL_MAX_MS  = 48UL * 60UL * 60UL * 1000UL; // 48 hours
+
+struct RateLimitEntry {
+  IPAddress ip;
+  uint8_t   fails    = 0;
+  uint32_t  nextOk   = 0;   // millis() when auth attempts are allowed again
+  uint32_t  lastSeen = 0;   // millis() for TTL/LRU
+  bool      used     = false;
+};
+
+RateLimitEntry rl[RL_SLOTS];
+
+static inline uint32_t rlPenaltyMs(uint8_t fails) {
+  // x10 backoff:
+  // 1 -> 5s
+  // 2 -> 50s
+  // 3 -> 500s
+  // 4 -> 5000s
+  // 5 -> 50000s
+  // ... cap at RL_MAX_MS (48h)
+  if (fails <= 1) return RL_BASE_MS;
+
+  uint64_t p = RL_BASE_MS;
+  for (uint8_t i = 1; i < fails; i++) {
+    if (p >= RL_MAX_MS) return RL_MAX_MS;
+    p *= 10ULL;
+    if (p > RL_MAX_MS) return RL_MAX_MS;
+  }
+  return (uint32_t)p;
+}
+
+
+static int rlFind(IPAddress ip) {
+  for (uint8_t i = 0; i < RL_SLOTS; i++) {
+    if (rl[i].used && rl[i].ip == ip) return (int)i;
+  }
+  return -1;
+}
+
+static int rlAlloc(IPAddress ip, uint32_t now) {
+  // Free slot
+  for (uint8_t i = 0; i < RL_SLOTS; i++) {
+    if (!rl[i].used) {
+      rl[i].used = true;
+      rl[i].ip = ip;
+      rl[i].fails = 0;
+      rl[i].nextOk = now;
+      rl[i].lastSeen = now;
+      return (int)i;
+    }
+  }
+
+  // Recycle expired (TTL)
+  for (uint8_t i = 0; i < RL_SLOTS; i++) {
+    if (rl[i].used && (uint32_t)(now - rl[i].lastSeen) > RL_TTL_MS) {
+      rl[i].used = true;
+      rl[i].ip = ip;
+      rl[i].fails = 0;
+      rl[i].nextOk = now;
+      rl[i].lastSeen = now;
+      return (int)i;
+    }
+  }
+
+  // LRU replace
+  uint8_t oldest = 0;
+  uint32_t oldestSeen = rl[0].lastSeen;
+  for (uint8_t i = 1; i < RL_SLOTS; i++) {
+    if (rl[i].lastSeen < oldestSeen) {
+      oldestSeen = rl[i].lastSeen;
+      oldest = i;
+    }
+  }
+  rl[oldest].used = true;
+  rl[oldest].ip = ip;
+  rl[oldest].fails = 0;
+  rl[oldest].nextOk = now;
+  rl[oldest].lastSeen = now;
+  return (int)oldest;
+}
+
+static int rlFindOrCreate(IPAddress ip, uint32_t now) {
+  int idx = rlFind(ip);
+  if (idx >= 0) return idx;
+  return rlAlloc(ip, now);
+}
+
+// =======================
 // === SETTINGS (NVS)   ===
 // =======================
 void loadSettings() {
@@ -96,7 +192,6 @@ void saveSettings() {
 // =======================
 // === TASK: STATUS LED ===
 // =======================
-// Runs independently from WiFiManager blocking calls.
 void ledTask(void* pvParameters) {
   pinMode(STATUS_LED_PIN, OUTPUT);
   for (;;) {
@@ -109,9 +204,39 @@ void ledTask(void* pvParameters) {
 // === AUTH + NETWORK   ===
 // =======================
 bool checkAuth() {
+  IPAddress rip = server.client().remoteIP();
+  uint32_t now = millis();
+
+  int idx = rlFindOrCreate(rip, now);
+  if (idx >= 0) {
+    rl[idx].lastSeen = now;
+
+    // If still penalized, reject quickly (no delay)
+    if ((int32_t)(now - rl[idx].nextOk) < 0) {
+      server.send(429, "text/plain", "Too many attempts. Try again later.");
+      return false;
+    }
+  }
+
   if (!server.authenticate(httpUser.c_str(), httpPass.c_str())) {
+    if (idx >= 0) {
+      if (rl[idx].fails < 255) rl[idx].fails++;
+      uint32_t pen = rlPenaltyMs(rl[idx].fails);
+
+      // Compute nextOk safely with uint32 wrap in mind
+      rl[idx].nextOk = now + pen;
+      rl[idx].lastSeen = now;
+    }
+
     server.requestAuthentication();
     return false;
+  }
+
+  // Success => reset counters for this IP
+  if (idx >= 0) {
+    rl[idx].fails = 0;
+    rl[idx].nextOk = now;
+    rl[idx].lastSeen = now;
   }
   return true;
 }
@@ -203,10 +328,6 @@ bool addDevice(const String& mac) {
 // =======================
 // === NETWORK SCAN (PING + ARP, ROBUST) ===
 // =======================
-// Goals:
-// - We DO ping all 254 hosts (best-effort) to "wake up" devices and speed up ARP population.
-// - But we NEVER skip ARP lookup if ping fails (Windows firewall often blocks ICMP but answers ARP).
-// - We always send ARP request and read ARP table (with a small retry) to be deterministic/robust.
 void doScan() {
   if (!ensureNetif()) {
     Serial.println("❌ Scan skipped: Network interface not ready");
@@ -234,15 +355,11 @@ void doScan() {
     IPAddress tgt;
     tgt.fromString(pref + String(i));
 
-    // Skip our own IP and gateway
     if (tgt == localIP) continue;
     if (tgt == gw) continue;
 
-    // 1) Best-effort ping (DO NOT GATE ON RESULT)
-    //    This keeps your "254 pings are OK" philosophy, but does not break ARP discovery.
     (void)Ping.ping(tgt, 1);
 
-    // 2) Convert IP to lwIP type
     ip4_addr_t ipa;
     ipa.addr = lwip_htonl(
       ((uint32_t)tgt[0] << 24) |
@@ -251,7 +368,6 @@ void doScan() {
        (uint32_t)tgt[3]
     );
 
-    // 3) ARP request + lookup (retry once to handle timing)
     struct eth_addr *mac_ptr = nullptr;
     const ip4_addr_t *ip_ret = nullptr;
 
@@ -271,7 +387,6 @@ void doScan() {
               mac_ptr->addr[0], mac_ptr->addr[1], mac_ptr->addr[2],
               mac_ptr->addr[3], mac_ptr->addr[4], mac_ptr->addr[5]);
 
-      // Skip empty/broadcast MACs
       if (strcmp(macBuf, "00:00:00:00:00:00") != 0 &&
           strcmp(macBuf, "FF:FF:FF:FF:FF:FF") != 0) {
         addDevice(String(macBuf));
@@ -335,7 +450,10 @@ void handleScan() {
 void handleDevices() {
   if (!checkAuth()) return;
 
-  String html = "<!DOCTYPE html><html><head><meta charset='utf-8'><title>WOL list</title></head><body>";
+  // evitar fragmentación por concatenación
+  String html;
+  html.reserve(2048);
+  html = "<!DOCTYPE html><html><head><meta charset='utf-8'><title>WOL list</title></head><body>";
   html += "<h1>WOL Devices</h1><ul>";
   for (size_t i = 0; i < deviceCount; ++i) {
     html += "<li>" + deviceList[i] + " <a href=\"/wake?mac=" + deviceList[i] + "\"><button>WOL</button></a></li>";
@@ -382,7 +500,6 @@ void handleForget() {
   WiFiManager wm;
   wm.resetSettings(); // clears WiFi credentials in flash
 
-  // Also reset app settings:
   prefs.begin("cfg", false);
   prefs.clear();
   prefs.end();
@@ -434,7 +551,6 @@ void setup() {
   Serial.begin(115200);
   delay(500);
 
-  // 1) Watchdog
   esp_task_wdt_init(WDT_TIMEOUT, true);
   esp_task_wdt_add(NULL);
 
@@ -442,17 +558,12 @@ void setup() {
   digitalWrite(RELAY_PIN, HIGH);
   pinMode(PC_LED_PIN, INPUT_PULLUP);
 
-  // 2) Load persisted settings (web user/pass + workerId)
   loadSettings();
-
-  // 3) Load persisted device list
   loadDevices();
 
-  // 4) Start LED task immediately (fast blink while connecting/AP)
   blinkInterval = 100;
   xTaskCreate(ledTask, "LedTask", 2048, nullptr, 1, nullptr);
 
-  // 5) WiFi events
   WiFi.mode(WIFI_STA);
   WiFi.setAutoReconnect(true);
   WiFi.persistent(true);
@@ -462,19 +573,18 @@ void setup() {
       Serial.println("✅ GOT_IP: Connected.");
       wifiOk = 1;
       lastStateChange = millis();
-      lwip_netif = nullptr; // force refresh
-      blinkInterval = 1000; // slow blink when connected
+      lwip_netif = nullptr;
+      blinkInterval = 1000;
     }
     if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
       Serial.println("⚠️ DISCONNECTED: WiFi lost.");
       wifiOk = 0;
       lastStateChange = millis();
-      lwip_netif = nullptr; // refresh after reconnection
-      blinkInterval = 100;  // fast blink when disconnected
+      lwip_netif = nullptr;
+      blinkInterval = 100;
     }
   });
 
-  // 6) WiFiManager with custom parameters (first setup UX)
   WiFiManager wm;
 
   WiFiManagerParameter p_info("<p><b>App settings</b></p>");
@@ -504,7 +614,6 @@ void setup() {
 
   Serial.println("🔄 Starting WiFiManager...");
 
-  // Temporarily remove this task from WDT while WiFiManager blocks.
   esp_task_wdt_delete(NULL);
   bool wifiConnected = wm.autoConnect("ControlPC_AP", "changeme1234");
   esp_task_wdt_add(NULL);
@@ -518,14 +627,13 @@ void setup() {
   wifiOk = (WiFi.status() == WL_CONNECTED) ? 1 : 0;
   blinkInterval = wifiOk ? 1000 : 100;
   lastStateChange = millis();
-  lwip_netif = nullptr; // force refresh after connect
+  lwip_netif = nullptr;
 
   Serial.print("🚀 Connected. IP: ");
   Serial.println(WiFi.localIP());
 
   udp.begin(9);
 
-  // 7) Web routes
   server.on("/",        handleRoot);
   server.on("/scan",    handleScan);
   server.on("/devices", handleDevices);
@@ -534,7 +642,6 @@ void setup() {
   server.on("/forget",  handleForget);
   server.begin();
 
-  // 8) Start scan task on core 1
   xTaskCreatePinnedToCore(scanTask, "ScanTask", 8192, nullptr, 1, &scanTaskHandle, 1);
 }
 
@@ -559,10 +666,10 @@ void loop() {
 
     bool ok = sendHeartbeat();
     if (ok) {
-      heartbeatInterval = 300000; // 5 min
+      heartbeatInterval = 300000;
       Serial.println("💤 Next heartbeat in 5 min.");
     } else {
-      heartbeatInterval = 30000; // 30 sec
+      heartbeatInterval = 30000;
       Serial.println("⚠️ Heartbeat failed. Retrying in 30 sec.");
     }
   }
