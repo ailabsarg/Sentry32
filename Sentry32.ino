@@ -58,7 +58,7 @@ volatile int blinkInterval = 100; // Fast blink while connecting / AP mode
 
 // Heartbeat
 unsigned long lastHeartbeat = 0;
-unsigned long heartbeatInterval = 300000; // 5 minutes
+unsigned long heartbeatInterval = 60000; // ✅ 1 minute (antes 5 min)
 
 // Scan control
 volatile uint32_t scanRequested = 0;
@@ -106,7 +106,6 @@ static inline uint32_t rlPenaltyMs(uint8_t fails) {
   }
   return (uint32_t)p;
 }
-
 
 static int rlFind(IPAddress ip) {
   for (uint8_t i = 0; i < RL_SLOTS; i++) {
@@ -326,6 +325,44 @@ bool addDevice(const String& mac) {
 }
 
 // =======================
+// === WOL (ROBUST)     ===
+// =======================
+// ✅ Nuevo helper: robustez primero (duplicados OK)
+bool sendWOLPacket(const String& mac) {
+  uint8_t m[6];
+  int ok = sscanf(mac.c_str(), "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
+                  &m[0], &m[1], &m[2], &m[3], &m[4], &m[5]);
+  if (ok != 6) {
+    Serial.println("❌ WOL: MAC inválida");
+    return false;
+  }
+
+  uint8_t pkt[102];
+  memset(pkt, 0xFF, 6);
+  for (int i = 1; i <= 16; ++i) memcpy(pkt + i * 6, m, 6);
+
+  IPAddress bcast(255, 255, 255, 255);
+
+  // ✅ Enviar varias veces y también por puerto 7 (compat)
+  for (int rep = 0; rep < 3; rep++) {
+    esp_task_wdt_reset();
+
+    udp.beginPacket(bcast, 9);
+    udp.write(pkt, sizeof(pkt));
+    udp.endPacket();
+
+    udp.beginPacket(bcast, 7);
+    udp.write(pkt, sizeof(pkt));
+    udp.endPacket();
+
+    vTaskDelay(pdMS_TO_TICKS(15));
+  }
+
+  Serial.println("✅ WOL: magic packets enviados");
+  return true;
+}
+
+// =======================
 // === NETWORK SCAN (PING + ARP, ROBUST) ===
 // =======================
 void doScan() {
@@ -465,18 +502,9 @@ void handleDevices() {
 void handleWake() {
   if (!checkAuth()) return;
 
+  // ✅ Legacy intacto pero con WOL robusto
   String mac = server.arg("mac");
-  uint8_t m[6];
-  sscanf(mac.c_str(), "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
-         &m[0], &m[1], &m[2], &m[3], &m[4], &m[5]);
-
-  uint8_t pkt[102];
-  memset(pkt, 0xFF, 6);
-  for (int i = 1; i <= 16; ++i) memcpy(pkt + i * 6, m, 6);
-
-  udp.beginPacket(IPAddress(255, 255, 255, 255), 9);
-  udp.write(pkt, sizeof(pkt));
-  udp.endPacket();
+  (void)sendWOLPacket(mac);
 
   server.sendHeader("Location", "/devices");
   server.send(303);
@@ -519,14 +547,19 @@ bool sendHeartbeat() {
   String url = "https://yourdomain.com/register_worker";
   HTTPClient http;
   http.setConnectTimeout(3000);
-  http.setTimeout(3000);
+  http.setTimeout(5000); // ✅ un poco más que 3000 para leer JSON respuesta
 
-  DynamicJsonDocument doc(512);
+  // ✅ payload (igual que antes + capabilities opcional)
+  DynamicJsonDocument doc(768);
   doc["hostname"] = WiFi.getHostname();
   doc["ip"] = WiFi.localIP().toString();
 
   String wid = workerId.length() ? workerId : String(WiFi.getHostname());
   doc["worker_id"] = wid;
+
+  // Informativo (no rompe nada si el backend viejo lo ignora)
+  doc["capabilities"]["agent"] = true;
+  doc["capabilities"]["wol"]   = true;
 
   String payload;
   serializeJson(doc, payload);
@@ -537,11 +570,52 @@ bool sendHeartbeat() {
   int httpCode = http.POST(payload);
   bool ok = (httpCode == 200);
 
-  if (ok) Serial.println("✅ Heartbeat OK");
-  else    Serial.printf("❌ Heartbeat failed: %d\n", httpCode);
+  if (!ok) {
+    Serial.printf("❌ Heartbeat failed: %d\n", httpCode);
+    http.end();
+    return false;
+  }
 
+  Serial.println("✅ Heartbeat OK");
+
+  // ✅ Nuevo: leer body y procesar commands[] si existe
+  String body = http.getString();
   http.end();
-  return ok;
+
+  if (body.length() == 0) return true;
+
+  DynamicJsonDocument resp(4096);
+  DeserializationError err = deserializeJson(resp, body);
+  if (err) {
+    Serial.printf("⚠️ Heartbeat JSON parse error: %s\n", err.c_str());
+    return true; // robustez: no fallar por parse
+  }
+
+  if (!resp.containsKey("commands")) return true;
+
+  JsonArray cmds = resp["commands"].as<JsonArray>();
+  if (cmds.isNull() || cmds.size() == 0) return true;
+
+  Serial.printf("📥 Heartbeat: %u command(s)\n", (unsigned)cmds.size());
+
+  for (JsonVariant v : cmds) {
+    esp_task_wdt_reset();
+
+    if (!v.is<JsonObject>()) continue;
+    JsonObject cmd = v.as<JsonObject>();
+
+    const char* type = cmd["type"] | "";
+    if (strcmp(type, "wol") == 0) {
+      String mac = String((const char*)(cmd["mac"] | ""));
+      if (mac.length() > 0) {
+        Serial.printf("⚡ CMD wol %s\n", mac.c_str());
+        (void)sendWOLPacket(mac); // ✅ duplicados OK
+      }
+    }
+    // (futuro) else if (strcmp(type, "scan") == 0) { scanRequested = 1; }
+  }
+
+  return true;
 }
 
 // =======================
@@ -666,11 +740,11 @@ void loop() {
 
     bool ok = sendHeartbeat();
     if (ok) {
-      heartbeatInterval = 300000;
-      Serial.println("💤 Next heartbeat in 5 min.");
+      heartbeatInterval = 60000; // ✅ 1 min normal
+      Serial.println("💤 Next heartbeat in 1 min.");
     } else {
-      heartbeatInterval = 30000;
-      Serial.println("⚠️ Heartbeat failed. Retrying in 30 sec.");
+      heartbeatInterval = 15000; // ✅ retry rápido para robustez
+      Serial.println("⚠️ Heartbeat failed. Retrying in 15 sec.");
     }
   }
 }
